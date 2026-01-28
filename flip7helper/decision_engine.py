@@ -19,6 +19,7 @@ class DecisionOutput:
     bust_probability_flip_three: float
     expected_value_next: float
     expected_value_flip_three: float
+    threshold_probability_next: float
     notes: Tuple[str, ...] = ()
 
 
@@ -40,7 +41,12 @@ class DecisionEngine:
     def __init__(self, composition: DeckComposition | None = None) -> None:
         self.base = composition or DeckComposition.standard()
 
-    def compute(self, state: RoundState, seen_counts: Mapping[str, int] | None = None) -> DecisionOutput:
+    def compute(
+        self,
+        state: RoundState,
+        seen_counts: Mapping[str, int] | None = None,
+        skip_flip_three: bool = False,
+    ) -> DecisionOutput:
         seen_counts = dict(seen_counts or {})
         deck = self.base.remaining_after_seen(seen_counts)
         denom = deck.total_cards()
@@ -52,8 +58,25 @@ class DecisionEngine:
         p_dup_number = deck.probability_of(dup_labels)
         bust_next = 0.0 if state.has_second_chance else p_dup_number
 
-        ev_next = self._ev_one_step_stay_after(state, deck)
-        bust_three, ev_three = self._approx_flip_three(state, deck)
+        ev_next = self._ev_one_step_stay_after(state, deck, skip_flip_three=skip_flip_three)
+
+        # Marginal stopping model: approximate break-even bust probability
+        # based on current bank S and average next-card value V_next.
+        # V_next is taken as a fixed 6.8 unless you later want to derive it
+        # dynamically from the remaining deck.
+        current_bank = self._apply_flip7_bonus_if_applicable(state, state.current_bank_value())
+        v_next = 6.8
+        if current_bank + v_next > 0.0:
+            p_threshold = v_next / (current_bank + v_next)
+        else:
+            p_threshold = 1.0
+
+        # When estimating Flip Three EV internally, avoid infinite recursion by
+        # optionally skipping the flip-three sub-calculation on recursive calls.
+        if skip_flip_three:
+            bust_three, ev_three = 0.0, float(ev_next)
+        else:
+            bust_three, ev_three = self._approx_flip_three(state, deck)
 
         notes = []
         if state.unique_count >= 7:
@@ -68,6 +91,7 @@ class DecisionEngine:
             bust_probability_flip_three=bust_three,
             expected_value_next=ev_next,
             expected_value_flip_three=ev_three,
+            threshold_probability_next=p_threshold,
             notes=tuple(notes),
         )
 
@@ -76,7 +100,12 @@ class DecisionEngine:
             return bank_value + 15
         return bank_value
 
-    def _ev_one_step_stay_after(self, state: RoundState, deck: DeckComposition) -> float:
+    def _ev_one_step_stay_after(
+        self,
+        state: RoundState,
+        deck: DeckComposition,
+        skip_flip_three: bool = False,
+    ) -> float:
         denom = deck.total_cards()
         if denom <= 0:
             return float(state.current_bank_value())
@@ -117,7 +146,13 @@ class DecisionEngine:
         cnt = deck.counts.get("flipthree", 0)
         if cnt:
             p = cnt / denom
-            _, ev3 = self._approx_flip_three(state, deck)
+            if skip_flip_three:
+                # When called from within a Flip Three approximation, avoid
+                # recursing again into another Flip Three simulation. Treat
+                # drawing Flip Three as roughly keeping current bank value.
+                ev3 = float(current_bank)
+            else:
+                _, ev3 = self._approx_flip_three(state, deck)
             ev_other += p * ev3
 
         cnt = deck.counts.get("secondchance", 0)
@@ -174,7 +209,8 @@ class DecisionEngine:
         seen_local: Dict[str, int] = {}
 
         for _ in range(3):
-            out = self.compute(tmp_state, seen_local)
+            # Use a recursion-safe compute that skips its own Flip Three approximation.
+            out = self.compute(tmp_state, seen_local, skip_flip_three=True)
             p_bust_step = out.bust_probability_next
             p_bust_total = 1.0 - (surv * (1.0 - p_bust_step))
             surv *= (1.0 - p_bust_step)

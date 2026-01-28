@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.venv/
 
 # Build / packaging artifacts
 build/
