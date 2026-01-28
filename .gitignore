@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Local calibration / debug images
+flip7_calibration*.png
+
