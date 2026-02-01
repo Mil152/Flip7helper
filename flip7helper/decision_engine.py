@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Tuple
 
-from .deck_engine import DeckComposition
-from .state import RoundState
+from flip7helper.deck_engine import DeckComposition
+from flip7helper.state import RoundState
 
 NUMBER_LABELS = tuple(str(i) for i in range(0, 13))
 
@@ -20,6 +20,7 @@ class DecisionOutput:
     expected_value_next: float
     expected_value_flip_three: float
     threshold_probability_next: float
+    average_gain_next_if_success: float
     notes: Tuple[str, ...] = ()
 
 
@@ -46,6 +47,7 @@ class DecisionEngine:
         state: RoundState,
         seen_counts: Mapping[str, int] | None = None,
         skip_flip_three: bool = False,
+        include_flip_three: bool = True,
     ) -> DecisionOutput:
         seen_counts = dict(seen_counts or {})
         deck = self.base.remaining_after_seen(seen_counts)
@@ -60,20 +62,35 @@ class DecisionEngine:
 
         ev_next = self._ev_one_step_stay_after(state, deck, skip_flip_three=skip_flip_three)
 
-        # Marginal stopping model: approximate break-even bust probability
-        # based on current bank S and average next-card value V_next.
-        # V_next is taken as a fixed 6.8 unless you later want to derive it
-        # dynamically from the remaining deck.
+        # Marginal stopping model: derive a dynamic average next-card value
+        # V_next from the full EV calculation and the current deck instead of
+        # using a fixed constant. Treat:
+        #   EV_next = (1 - P_b) * (S + V_next) + P_b * B
+        # where S is current bank and B is the payoff on bust.
+        # Solve for V_next:
+        #   V_next = (EV_next - P_b * B) / (1 - P_b) - S
+        # This implicitly assigns values to special cards via _ev_one_step_stay_after.
         current_bank = self._apply_flip7_bonus_if_applicable(state, state.current_bank_value())
-        v_next = 6.8
+        p_b = bust_next
+        # Bust payoff: 0 if you actually bust, or current bank if Second Chance
+        # saves you and you can still bank.
+        bust_payoff = float(current_bank) if state.has_second_chance else 0.0
+
+        if p_b < 1.0 - 1e-9:
+            v_next = (ev_next - (p_b * bust_payoff)) / (1.0 - p_b) - current_bank
+        else:
+            v_next = 0.0
         if current_bank + v_next > 0.0:
             p_threshold = v_next / (current_bank + v_next)
         else:
             p_threshold = 1.0
 
+        # Flip Three is the most expensive part of the model. Allow callers to
+        # skip it (e.g. UI when Flip Three is not active).
+        #
         # When estimating Flip Three EV internally, avoid infinite recursion by
         # optionally skipping the flip-three sub-calculation on recursive calls.
-        if skip_flip_three:
+        if (not include_flip_three) or skip_flip_three:
             bust_three, ev_three = 0.0, float(ev_next)
         else:
             bust_three, ev_three = self._approx_flip_three(state, deck)
@@ -92,6 +109,7 @@ class DecisionEngine:
             expected_value_next=ev_next,
             expected_value_flip_three=ev_three,
             threshold_probability_next=p_threshold,
+            average_gain_next_if_success=v_next,
             notes=tuple(notes),
         )
 
